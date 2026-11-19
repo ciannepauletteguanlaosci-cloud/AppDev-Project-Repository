@@ -1,0 +1,25 @@
+.venv/
+.reference/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+node_modules/
+test-results/
+
+.venv-local/
+penny-backup*.db
+
+.DS_Store
+/.vscode/
+/AppDev-Project-Repository/
+/Screenshot*.png
+/Penny Wais.pdf
+/docs/reports/
+/docs/screenshots/*.png
+!/docs/screenshots/dashboard-desktop.png
+*.md
+!/README.md
