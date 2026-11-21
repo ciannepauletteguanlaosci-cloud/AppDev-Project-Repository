@@ -11,6 +11,13 @@ from test_app import env, account, tx
 IMAGE=b'\x89PNG\r\n\x1a\nsynthetic-unit-fixture'
 
 
+PREVIEW_EMAIL='owner@example.com'
+
+
+def wallet_user(env):
+    return account(env)
+
+
 def create_account(c,provider='GCash',amount=100000,funding='new',key=None):
     return c.post('/api/wallet-accounts',json={'provider':provider,'amount':amount,'funding':funding,'request_id':key or provider+'-account-request-0001'})
 
@@ -38,8 +45,62 @@ def expense(aid,amount=12345):
     return {'account_id':aid,'amount':amount,'description':'Cafe lunch','category':'Food','date':str(date.today())}
 
 
+@pytest.mark.parametrize('role',['user','admin'])
+def test_wallet_and_receipt_features_are_open_but_user_records_stay_private(scanner,monkeypatch,role):
+    env,_,_=scanner
+    # Configuring the old reserved login must not restrict everyone else's access.
+    monkeypatch.setattr(env,'WALLET_PREVIEW_EMAIL',PREVIEW_EMAIL)
+    env.init()
+    member=account(env,'member@example.com')
+    other=wallet_user(env)
+    with env.db() as db:
+        db.execute('UPDATE users SET role=? WHERE email=?',(role,'member@example.com'))
+    assert create_account(TestClient(env.app)).status_code==401
+    assert create_account(other).status_code==200
+    assert create_account(member,'Maya').status_code==200
+    state=member.get('/api/state').json()
+    assert state['user']['wallet_preview'] is True
+    assert len(state['wallet_accounts'])==1
+    assert state['wallet_accounts'][0]['provider']=='Maya'
+    assert state['unassigned_balance']==0
+    member_id=wallet_id(member)
+    other_id=wallet_id(other)
+    assert member.post('/api/transactions',json={**expense(other_id),'kind':'income'}).status_code==404
+    other_scan=scan(other)
+    assert other_scan.status_code==200
+    assert member.post(f"/api/receipts/{other_scan.json()['id']}/confirm",json=expense(member_id)).status_code==404
+    result=scan(member)
+    assert result.status_code==200
+    path=f"/api/receipts/{result.json()['id']}/confirm"
+    assert member.post(path,json=expense(other_id)).status_code==404
+    assert member.post(path,json=expense(member_id)).status_code==200
+    assert member.get('/api/state').json()['balance']==87655
+    assert other.get('/api/state').json()['balance']==100000
+    expected=200 if role=='admin' else 403
+    assert member.get('/api/admin').status_code==expected
+    assert member.post('/api/admin/database/unlock',json={'password':'correct-horse-123'}).status_code==expected
+    if role=='user':
+        assert member.get('/api/admin/database/users').status_code==403
+    with env.db() as db:
+        db.execute('UPDATE users SET active=0 WHERE email=?',('member@example.com',))
+    assert create_account(member,'BPI').status_code==401
+    assert scan(member).status_code==401
+
+
+def test_existing_wallet_accounts_stay_available_without_preview_configuration(env,monkeypatch):
+    member=wallet_user(env)
+    assert create_account(member,amount=50000).status_code==200
+    monkeypatch.setattr(env,'WALLET_PREVIEW_EMAIL','')
+    aid=wallet_id(member)
+    assert member.post('/api/transactions',json={**expense(aid,20000),'kind':'expense'}).status_code==200
+    assert member.post('/api/transactions',json={**expense(aid,30001),'kind':'expense'}).status_code==400
+    state=member.get('/api/state').json()
+    assert state['balance']==30000 and state['wallet_accounts'][0]['balance']==30000
+    assert all(entry['account_id']==aid for entry in state['transactions'])
+
+
 def test_accounts_new_funds_and_existing_funds_no_double_count(env):
-    c=account(env);tx(c,'income',50000)
+    c=wallet_user(env);tx(c,'income',50000)
     assert create_account(c,amount=20000,funding='existing').status_code==200
     s=c.get('/api/state').json()
     assert s['balance']==50000 and s['unassigned_balance']==30000 and s['wallet_accounts'][0]['balance']==20000
@@ -59,7 +120,7 @@ def test_accounts_new_funds_and_existing_funds_no_double_count(env):
 
 
 def test_scan_has_no_balance_effect_and_confirm_posts_one_selected_debit(scanner):
-    env,calls,analysis=scanner;c=account(env)
+    env,calls,analysis=scanner;c=wallet_user(env)
     create_account(c);create_account(c,'BPI',50000)
     before=c.get('/api/state').json();r=scan(c)
     assert r.status_code==200,r.text
@@ -86,11 +147,14 @@ def test_scan_has_no_balance_effect_and_confirm_posts_one_selected_debit(scanner
 
 
 def test_receipt_account_ownership_reserves_and_insufficient_funds(scanner):
-    env,calls,_=scanner;c=account(env);other=account(env,'other@example.com')
-    create_account(c,amount=10000);create_account(c,'Maya',100000);create_account(other)
+    env,calls,_=scanner;c=wallet_user(env);other=account(env,'other@example.com')
+    create_account(c,amount=10000);create_account(c,'Maya',100000)
+    with env.db() as db:
+        other_uid=db.execute('SELECT id FROM users WHERE email=?',('other@example.com',)).fetchone()[0]
+        foreign_id=db.execute("INSERT INTO wallet_accounts(user_id,provider,name) VALUES(?,'BPI','Legacy BPI')",(other_uid,)).lastrowid
     rid=scan(c).json()['id'];path=f'/api/receipts/{rid}/confirm'
-    assert other.post(path,json=expense(wallet_id(other))).status_code==404
-    assert c.post(path,json=expense(wallet_id(other))).status_code==404
+    assert other.post(path,json=expense(foreign_id)).status_code==404
+    assert c.post(path,json=expense(foreign_id)).status_code==404
     assert c.post(path,json=expense(wallet_id(c))).status_code==400
     assert c.post('/api/buckets',json={'name':'Savings','category':'Savings','amount':109000,'target':120000}).status_code==200
     maya=c.get('/api/state').json()['wallet_accounts'][1]['id']
@@ -105,7 +169,7 @@ def test_receipt_account_ownership_reserves_and_insufficient_funds(scanner):
 
 
 def test_receipt_concurrent_confirmations_deduct_once(scanner):
-    env,_,_=scanner;c=account(env);create_account(c)
+    env,_,_=scanner;c=wallet_user(env);create_account(c)
     rid=scan(c).json()['id'];aid=wallet_id(c)
     def save(_):
         client=TestClient(env.app);client.cookies.update(c.cookies)
@@ -115,7 +179,7 @@ def test_receipt_concurrent_confirmations_deduct_once(scanner):
 
 
 def test_pending_receipt_retry_reuses_analysis_and_user_can_correct_it(scanner):
-    env,calls,analysis=scanner;c=account(env);create_account(c)
+    env,calls,analysis=scanner;c=wallet_user(env);create_account(c)
     analysis.update(amount=None,receipt_date=None,currency='UNKNOWN')
     r=scan(c);assert r.status_code==200
     assert scan(c).json()==r.json() and len(calls)==1
@@ -126,7 +190,7 @@ def test_pending_receipt_retry_reuses_analysis_and_user_can_correct_it(scanner):
 def test_scan_requires_login_account_valid_image_and_bounded_upload(scanner):
     env,calls,_=scanner
     assert scan(TestClient(env.app)).status_code==401
-    c=account(env)
+    c=wallet_user(env)
     assert scan(c).status_code==400
     create_account(c)
     assert scan(c,b'<svg>not a photo</svg>').status_code==415
@@ -136,7 +200,7 @@ def test_scan_requires_login_account_valid_image_and_bounded_upload(scanner):
 
 @pytest.mark.parametrize('updates',[{'is_receipt':False},{'currency':'OTHER'},{'amount':-1},{'amount':123.45},{'category':'<script>'},{'amount':'9999'}])
 def test_scan_rejects_unsafe_or_invalid_extraction(scanner,updates):
-    env,_,analysis=scanner;c=account(env);create_account(c)
+    env,_,analysis=scanner;c=wallet_user(env);create_account(c)
     analysis.update(updates)
     assert scan(c).status_code==422
     assert c.get('/api/state').json()['balance']==100000
@@ -145,7 +209,7 @@ def test_scan_rejects_unsafe_or_invalid_extraction(scanner,updates):
 
 @pytest.mark.parametrize('status,expected',[(400,503),(403,503),(429,429),(500,503)])
 def test_provider_failures_never_deduct_or_leak_keys(scanner,monkeypatch,status,expected):
-    env,_,_=scanner;c=account(env);create_account(c)
+    env,_,_=scanner;c=wallet_user(env);create_account(c)
     monkeypatch.setattr(env.receipts.httpx,'post',lambda *a,**kw:httpx.Response(status,json={'secret':'test-only-secret'}))
     r=scan(c)
     assert r.status_code==expected and 'test-only-secret' not in r.text
@@ -153,7 +217,7 @@ def test_provider_failures_never_deduct_or_leak_keys(scanner,monkeypatch,status,
 
 
 def test_provider_timeout_and_malformed_output(scanner,monkeypatch):
-    env,_,_=scanner;c=account(env);create_account(c)
+    env,_,_=scanner;c=wallet_user(env);create_account(c)
     def timeout(*a,**kw): raise httpx.ReadTimeout('secret')
     monkeypatch.setattr(env.receipts.httpx,'post',timeout)
     assert scan(c).status_code==504
@@ -163,7 +227,7 @@ def test_provider_timeout_and_malformed_output(scanner,monkeypatch):
 
 
 def test_ai_quota_shared_between_chat_and_receipt_scans(scanner):
-    env,calls,_=scanner;c=account(env);create_account(c)
+    env,calls,_=scanner;c=wallet_user(env);create_account(c)
     uid=c.get('/api/state').json()['user']['id']
     with env.db() as db:
         db.executemany('INSERT INTO ai_requests VALUES(?,?)',[(uid,env.time.time())]*5)
@@ -172,9 +236,9 @@ def test_ai_quota_shared_between_chat_and_receipt_scans(scanner):
 
 
 def test_manual_and_shared_expenses_respect_selected_account(env):
-    a,b=account(env),account(env,'other@example.com')
-    create_account(a,amount=10000);create_account(a,'BPI',50000);create_account(b,amount=10000)
-    aid=wallet_id(a);bid=wallet_id(b)
+    a,b=wallet_user(env),account(env,'other@example.com')
+    create_account(a,amount=10000);create_account(a,'BPI',50000);tx(b,'income',10000)
+    aid=wallet_id(a)
     # Unassigned money cannot silently spend a named account.
     assert tx(a,'expense',1).status_code==400
     assert a.post('/api/transactions',json={**expense(aid,10001),'kind':'expense'}).status_code==400
@@ -186,10 +250,10 @@ def test_manual_and_shared_expenses_respect_selected_account(env):
     auid=a.get('/api/state').json()['user']['id'];buid=b.get('/api/state').json()['user']['id']
     shared={'description':'Dinner','amount':10000,'participants':[auid,buid],'account_id':aid}
     assert a.post(f"/api/groups/{g['id']}/expenses",json=shared).status_code==200
-    assert b.post(f"/api/groups/{g['id']}/payments",json={'receiver':auid,'amount':5000,'account_id':bid}).status_code==200
+    assert b.post(f"/api/groups/{g['id']}/payments",json={'receiver':auid,'amount':5000}).status_code==200
     s=a.get('/api/state').json()
     assert s['wallet_accounts'][0]['balance']==0 and s['unassigned_balance']==5000
-    assert b.get('/api/state').json()['wallet_accounts'][0]['balance']==5000
+    assert b.get('/api/state').json()['balance']==5000
     # Income cannot be deleted if it would overdraw that account, even if another has funds.
     tid=next(t['id'] for t in s['transactions'] if t['description']=='Cafe lunch' and t['kind']=='income')
     assert a.delete(f'/api/transactions/{tid}').status_code==400

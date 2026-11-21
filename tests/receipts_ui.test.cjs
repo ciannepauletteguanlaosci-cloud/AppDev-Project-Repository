@@ -20,7 +20,7 @@ function harness(){
   const run=s=>vm.runInContext(s,context);
   run(`globalThis.calls=[];api=async(path,method,body)=>{calls.push({path,method,body});return {ok:true}};
     modal=(title,fields,save,label)=>{globalThis.review={title,fields,save,label}};
-    state={user:{id:1,name:'Ana'},balance:120000,unallocated:110000,unassigned_balance:0,wallet_accounts:[{id:1,provider:'GCash',name:'My GCash',balance:100000},{id:2,provider:'BPI',name:'BPI savings',balance:20000}]};`);
+    state={user:{id:1,name:'Ana',role:'user',wallet_preview:true},transactions:[],buckets:[],budgets:[],forecast:{ready:false},balance:120000,unallocated:110000,unassigned_balance:0,wallet_accounts:[{id:1,provider:'GCash',name:'My GCash',balance:100000},{id:2,provider:'BPI',name:'BPI savings',balance:20000}]};`);
   return {run,node};
 }
 
@@ -52,6 +52,38 @@ test('receipt preview explains insufficient account funds and reserved money',()
   assert.match(node('#receipt-balance-preview').textContent,/Not enough/);
   run('state.unallocated=100');node('#f-amount').value='50';node('#f-amount').handlers.input();
   assert.match(node('#receipt-balance-preview').textContent,/Release bucket/);
+});
+
+test('every signed-in user can reach wallet and receipt features from desktop and mobile',()=>{
+  for(const role of ['user','admin']){
+    const {run,node}=harness();
+    run(`state.user.role='${role}';state.user.wallet_preview=false;page='accounts';render();`);
+    const html=node('#app').innerHTML;
+    const mobile=html.match(/<nav class="mobile-menu-links"[^>]*>(.*?)<\/nav>/s)[1];
+    assert.match(mobile,/data-nav="accounts" aria-current="page"/);
+    assert.match(mobile,/data-nav="budgets"/);
+    assert.match(mobile,/data-nav="connections"/);
+    assert.match(html,/Your money, by account/);
+    for(const dest of ['admin','database']){
+      assert.equal(mobile.includes(`data-nav="${dest}"`),role==='admin');
+      assert.equal(html.includes(`data-nav="${dest}"`),role==='admin');
+    }
+    for(const screen of ['dashboard()','transactions()','accountsPage()']){
+      assert.match(run(screen),/data-action="scan-receipt"/);
+    }
+    assert.match(run('help()'),/data-nav="accounts"/);
+  }
+});
+
+test('ordinary users cannot open Admin or Database using a direct URL',()=>{
+  for(const destination of ['admin','database']){
+    const {run,node}=harness();
+    run(`page='${destination}';location.hash='#${destination}';
+      location.replace=hash=>location.hash=hash;loadBankOverview=()=>{};render();`);
+    assert.equal(run('page'),'dashboard');
+    assert.equal(run('location.hash'),'#dashboard');
+    assert.doesNotMatch(node('#app').innerHTML,/data-nav="admin"|data-nav="database"|id="admin-content"|id="database-view"/);
+  }
 });
 
 test('account setup supports assigning existing funds and protects retries',async()=>{

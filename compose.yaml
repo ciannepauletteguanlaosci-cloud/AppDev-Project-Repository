@@ -9,6 +9,7 @@ services:
       - ./tests:/app/tests:ro
       - penny-data:/data
     environment:
+      PENNY_WALLET_PREVIEW_EMAIL: ${PENNY_WALLET_PREVIEW_EMAIL:-}
       PENNY_DB: /data/penny.db
       PENNY_DEV: "1"
       WATCHFILES_FORCE_POLLING: "true"

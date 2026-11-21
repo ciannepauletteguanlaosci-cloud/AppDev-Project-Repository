@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    monkeypatch.setenv('PENNY_WALLET_PREVIEW_EMAIL','')
     monkeypatch.setenv('PENNY_DB',str(tmp_path/'test.db'))
     from app import main
     importlib.reload(main)
